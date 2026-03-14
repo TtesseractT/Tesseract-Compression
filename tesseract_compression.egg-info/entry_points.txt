@@ -1,0 +1,2 @@
+[console_scripts]
+tesseract = tesseract.cli:main

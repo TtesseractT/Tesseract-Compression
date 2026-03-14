@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: tesseract-compression
+Version: 1.0.0
+Summary: Tesseract Compression System - Deduplication-based archiver for cold storage
+Requires-Python: >=3.9
+Requires-Dist: tqdm>=4.60.0
+Requires-Dist: cryptography>=41.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
