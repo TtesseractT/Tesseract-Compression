@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="tesseract-compression",
-    version="1.0.0",
+    version="2.0.0",
     description="Tesseract Compression System - Deduplication-based archiver for cold storage",
     packages=find_packages(),
     python_requires=">=3.9",

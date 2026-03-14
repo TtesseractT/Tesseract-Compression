@@ -58,66 +58,73 @@ from .scanner import FileEntry, FileScanner
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB streaming chunks
-SMALL_FILE_THRESHOLD = 1 * 1024 * 1024  # 1 MB — files below this get fast compression
+SMALL_FILE_THRESHOLD = 4 * 1024 * 1024  # 4 MB — files below this get fast compression
 FAST_COMPRESSION_LEVEL = 3  # zstd level 3: still great ratio, ~50x faster than 19+
+SHARD_TARGET_SIZE = 500 * 1024 * 1024  # 500 MB — target size for multi-file shards
 
 
-def _compress_shard_worker(
-    source_path_str: str,
+def _compress_multi_shard_worker(
+    file_specs: List[Tuple[str, str, str, int]],
     shard_path_str: str,
-    relative_path: str,
-    full_hash: str,
-    original_size: int,
     compression_level: int,
-) -> Tuple[str, str, str, int, int, Optional[str]]:
-    """Worker for parallel shard compression. Uses ThreadPoolExecutor (zstd releases the GIL).
+) -> Tuple[str, List[Tuple[str, str, int, int, int]], Optional[str]]:
+    """Worker that compresses multiple files into one shard (zstd releases the GIL).
 
-    Adaptive compression: small files get FAST_COMPRESSION_LEVEL (high levels
-    gain almost nothing on small data), large files get the requested level.
+    Args:
+        file_specs: List of (source_path, relative_path, full_hash, original_size).
+        shard_path_str: Path to write the shard file.
+        compression_level: Requested zstd level (adaptive for small files).
 
-    Returns (shard_path, relative_path, full_hash, original_size, compressed_size, error).
+    Returns:
+        (shard_path, results_list, error) where results_list entries are
+        (relative_path, full_hash, original_size, compressed_size, offset_in_shard).
     """
     try:
-        # Adaptive level: high compression wastes CPU on small files
-        effective_level = FAST_COMPRESSION_LEVEL if original_size < SMALL_FILE_THRESHOLD else compression_level
-        cctx = zstd.ZstdCompressor(level=effective_level)
-        compressor = cctx.compressobj()
-        compressed_size = 0
-
+        results = []
         with open(shard_path_str, "wb") as shard_fh:
-            # Write placeholder block header
-            shard_fh.write(b"\x00" * BLOCK_HEADER_SIZE)
+            for source_path_str, relative_path, full_hash, original_size in file_specs:
+                offset_in_shard = shard_fh.tell()
 
-            with open(source_path_str, "rb") as src:
-                while True:
-                    chunk = src.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    compressed = compressor.compress(chunk)
-                    if compressed:
-                        shard_fh.write(compressed)
-                        compressed_size += len(compressed)
+                effective_level = FAST_COMPRESSION_LEVEL if original_size < SMALL_FILE_THRESHOLD else compression_level
+                cctx = zstd.ZstdCompressor(level=effective_level)
+                compressor = cctx.compressobj()
+                compressed_size = 0
 
-            final = compressor.flush()
-            if final:
-                shard_fh.write(final)
-                compressed_size += len(final)
+                # Write placeholder block header
+                shard_fh.write(b"\x00" * BLOCK_HEADER_SIZE)
 
-            # Seek back and write actual block header
-            current_pos = shard_fh.tell()
-            shard_fh.seek(0)
-            block_header = pack_block_header(
-                content_hash=full_hash,
-                original_size=original_size,
-                compressed_size=compressed_size,
-            )
-            shard_fh.write(block_header)
-            shard_fh.seek(current_pos)
+                with open(source_path_str, "rb") as src:
+                    while True:
+                        chunk = src.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        compressed = compressor.compress(chunk)
+                        if compressed:
+                            shard_fh.write(compressed)
+                            compressed_size += len(compressed)
 
-        return (shard_path_str, relative_path, full_hash, original_size, compressed_size, None)
+                final = compressor.flush()
+                if final:
+                    shard_fh.write(final)
+                    compressed_size += len(final)
+
+                # Seek back and write actual block header
+                current_pos = shard_fh.tell()
+                shard_fh.seek(offset_in_shard)
+                block_header = pack_block_header(
+                    content_hash=full_hash,
+                    original_size=original_size,
+                    compressed_size=compressed_size,
+                )
+                shard_fh.write(block_header)
+                shard_fh.seek(current_pos)
+
+                results.append((relative_path, full_hash, original_size, compressed_size, offset_in_shard))
+
+        return (shard_path_str, results, None)
     except Exception as e:
-        return (shard_path_str, relative_path, full_hash, original_size, 0, str(e))
-DEFAULT_COMPRESSION_LEVEL = 19
+        return (shard_path_str, [], str(e))
+DEFAULT_COMPRESSION_LEVEL = 9
 
 
 class TesseractEncoder:
@@ -315,6 +322,8 @@ class TesseractEncoder:
             self.progress_callback("phase", "staging", total=len(unique_entries))
 
             shard_compressed_sizes: Dict[str, int] = {}
+            # Maps relative_path -> (shard_id, offset_in_shard, compressed_size)
+            shard_file_map: Dict[str, Tuple[str, int, int]] = {}
             solid_offset_map: Dict[str, Tuple[int, int]] = {}
 
             if self.solid:
@@ -332,59 +341,96 @@ class TesseractEncoder:
             else:
                 if encryptor:
                     # Encrypted mode: sequential (encryptor not picklable)
-                    for i, entry in enumerate(unique_entries):
-                        shard_id = f"shard_{i:06d}"
-                        shard_file = staging.shard_path(shard_id)
-                        try:
-                            with open(shard_file, "wb") as shard_fh:
-                                compressed_size = self._write_file_block(
-                                    shard_fh, entry, encryptor
-                                )
-                            staging.register_shard(
-                                shard_id, entry.relative_path,
-                                entry.full_hash or "", entry.size,
-                                compressed_size=compressed_size,
+                    # Pack into multi-file shards targeting SHARD_TARGET_SIZE
+                    shard_idx = 0
+                    shard_id = f"shard_{shard_idx:06d}"
+                    shard_file = staging.shard_path(shard_id)
+                    shard_fh = open(shard_file, "wb")
+                    shard_written = 0
+                    try:
+                        for entry in unique_entries:
+                            compressed_size = self._write_file_block(
+                                shard_fh, entry, encryptor
                             )
+                            offset_in_shard = shard_written
+                            shard_written += BLOCK_HEADER_SIZE + compressed_size
+                            shard_file_map[entry.relative_path] = (shard_id, offset_in_shard, compressed_size)
                             shard_compressed_sizes[entry.relative_path] = compressed_size
                             self.progress_callback("step", 1)
-                        except (OSError, PermissionError) as e:
-                            logger.error(f"Failed to stage {entry.relative_path}: {e}")
-                            raise
-                else:
-                    # Normal mode: parallel shard compression
-                    # ThreadPoolExecutor works because zstd releases the GIL during compression
-                    batch_size = 2000
-                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                        for start in range(0, len(unique_entries), batch_size):
-                            batch = unique_entries[start:start + batch_size]
-                            futures = {}
-                            for j, entry in enumerate(batch):
-                                idx = start + j
-                                shard_id = f"shard_{idx:06d}"
-                                shard_file = staging.shard_path(shard_id)
-                                future = executor.submit(
-                                    _compress_shard_worker,
-                                    str(entry.path),
-                                    str(shard_file),
-                                    entry.relative_path,
-                                    entry.full_hash or "",
-                                    entry.size,
-                                    self.compression_level,
-                                )
-                                futures[future] = (shard_id, entry)
 
-                            for future in as_completed(futures):
-                                shard_id, entry = futures[future]
-                                shard_path_str, rel_path, fhash, orig_size, comp_size, error = future.result()
-                                if error:
-                                    logger.error(f"Failed to stage {rel_path}: {error}")
-                                    raise RuntimeError(f"Shard compression failed for {rel_path}: {error}")
+                            # Start a new shard if current exceeds target
+                            if shard_written >= SHARD_TARGET_SIZE:
+                                shard_fh.close()
                                 staging.register_shard(
-                                    shard_id, rel_path, fhash, orig_size,
-                                    compressed_size=comp_size,
+                                    shard_id, "__multi__", "", 0,
+                                    compressed_size=shard_written,
                                 )
+                                shard_idx += 1
+                                shard_id = f"shard_{shard_idx:06d}"
+                                shard_file = staging.shard_path(shard_id)
+                                shard_fh = open(shard_file, "wb")
+                                shard_written = 0
+                        # Close and register the last shard
+                        shard_fh.close()
+                        if shard_written > 0:
+                            staging.register_shard(
+                                shard_id, "__multi__", "", 0,
+                                compressed_size=shard_written,
+                            )
+                    except Exception:
+                        shard_fh.close()
+                        raise
+                else:
+                    # Normal mode: parallel multi-file shard compression
+                    # Bin-pack files into shard groups targeting SHARD_TARGET_SIZE
+                    shard_groups: List[List[Tuple[str, str, str, int]]] = []
+                    current_group: List[Tuple[str, str, str, int]] = []
+                    current_size = 0
+                    for entry in unique_entries:
+                        current_group.append((
+                            str(entry.path), entry.relative_path,
+                            entry.full_hash or "", entry.size,
+                        ))
+                        current_size += entry.size
+                        if current_size >= SHARD_TARGET_SIZE:
+                            shard_groups.append(current_group)
+                            current_group = []
+                            current_size = 0
+                    if current_group:
+                        shard_groups.append(current_group)
+
+                    logger.info(f"  Packed {len(unique_entries)} files into {len(shard_groups)} shards")
+
+                    # ThreadPoolExecutor: zstd releases the GIL during compression
+                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                        futures = {}
+                        for idx, group in enumerate(shard_groups):
+                            shard_id = f"shard_{idx:06d}"
+                            shard_file = staging.shard_path(shard_id)
+                            future = executor.submit(
+                                _compress_multi_shard_worker,
+                                group,
+                                str(shard_file),
+                                self.compression_level,
+                            )
+                            futures[future] = shard_id
+
+                        for future in as_completed(futures):
+                            shard_id = futures[future]
+                            shard_path_str, results, error = future.result()
+                            if error:
+                                logger.error(f"Failed to stage {shard_id}: {error}")
+                                raise RuntimeError(f"Shard compression failed for {shard_id}: {error}")
+                            total_shard_size = 0
+                            for rel_path, fhash, orig_size, comp_size, offset_in_shard in results:
+                                shard_file_map[rel_path] = (shard_id, offset_in_shard, comp_size)
                                 shard_compressed_sizes[rel_path] = comp_size
+                                total_shard_size += BLOCK_HEADER_SIZE + comp_size
                                 self.progress_callback("step", 1)
+                            staging.register_shard(
+                                shard_id, "__multi__", "", 0,
+                                compressed_size=total_shard_size,
+                            )
 
             # ── Phase 7: Verify all shards ────────────────────────
             staging.save_index()
@@ -414,7 +460,8 @@ class TesseractEncoder:
 
             # ── Phase 9: Assemble archive from shards ─────────────
             logger.info(f"Assembling archive to {output_path}...")
-            self.progress_callback("phase", "assembling", total=len(unique_entries))
+            num_shards = len(staging.shards)
+            self.progress_callback("phase", "assembling", total=num_shards)
 
             offset_map: Dict[str, Tuple[int, int]] = {}
 
@@ -432,16 +479,21 @@ class TesseractEncoder:
                     # Stream the solid shard into the archive
                     staging.stream_shard_to("solid_stream", archive)
                     offset_map = solid_offset_map
+                    self.progress_callback("step", 1)
                 else:
-                    # Stream each file shard into the archive in order
-                    for i, entry in enumerate(unique_entries):
-                        shard_id = f"shard_{i:06d}"
-                        block_offset = archive.tell()
+                    # Stream multi-file shards into the archive in order
+                    for idx in range(num_shards):
+                        shard_id = f"shard_{idx:06d}"
+                        shard_base_offset = archive.tell()
                         staging.stream_shard_to(shard_id, archive)
-                        offset_map[entry.relative_path] = (
-                            block_offset,
-                            shard_compressed_sizes[entry.relative_path],
-                        )
+
+                        # Compute final archive offsets for each file in this shard
+                        for rel_path, (sid, offset_in_shard, comp_size) in shard_file_map.items():
+                            if sid == shard_id:
+                                offset_map[rel_path] = (
+                                    shard_base_offset + offset_in_shard,
+                                    comp_size,
+                                )
                         self.progress_callback("step", 1)
 
                 data_end = archive.tell()

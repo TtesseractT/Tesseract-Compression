@@ -6,8 +6,11 @@ Tesseract scans a directory, detects duplicate files using multi-stage content-a
 
 ## Features
 
-- **Content-aware deduplication** — 3-stage pipeline: metadata grouping → partial hash (64KB) → full SHA-256
-- **Failsafe staged encoding** — files are compressed into verified shards before atomic assembly; source files are never modified
+- **Content-aware deduplication** — 3-stage pipeline: metadata grouping → partial hash (64KB BLAKE3) → full BLAKE3
+- **Zstandard compression** — modern zstd compression with adaptive levels (fast for small files, full level for large files)
+- **Failsafe staged encoding** — files are compressed into verified multi-file shards (~500MB each) before atomic assembly; source files are never modified
+- **BLAKE3 hashing** — cryptographically secure, ~6x faster than SHA-256, used everywhere
+- **Persistent hash cache** — SQLite-backed cache for scan results, partial hashes, and full hashes; survives interruptions
 - **AES-256-GCM encryption** — password-based with PBKDF2-HMAC-SHA256 (600K iterations)
 - **Solid compression** — optional single continuous compressed stream for better ratios
 - **Recovery records** — XOR parity-based self-repair (1-30% redundancy)
@@ -15,13 +18,15 @@ Tesseract scans a directory, detects duplicate files using multi-stage content-a
 - **Archive comments** — embed text metadata in archives
 - **File permission storage** — optional preservation of file permissions
 - **Archive locking** — mark archives as finalized
-- **Multi-threaded** — parallel hashing and deduplication
+- **Fully parallelized** — multi-threaded hashing, deduplication, compression, verification, and preflight checks
 
 ## Requirements
 
 - Python ≥ 3.9
 - `tqdm` ≥ 4.60.0
 - `cryptography` ≥ 41.0.0
+- `blake3` ≥ 0.3.0
+- `zstandard` ≥ 0.19.0
 
 ## Installation
 
@@ -60,7 +65,7 @@ tesseract encode <source> <output> [options]
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
 | `--workers` | `-w` | int | CPU count - 1 | Number of CPU cores to use |
-| `--compression-level` | `-c` | 0-9 | 6 | zlib compression level (0 = none, 9 = max) |
+| `--compression-level` | `-c` | 1-22 | 9 | zstd compression level |
 | `--exclude` | `-e` | str | — | Glob pattern to exclude (repeatable) |
 | `--solid` | `-s` | flag | off | Solid compression mode (better ratio, slower random access) |
 | `--password` | `-p` | str | — | Encrypt with this password |
@@ -84,7 +89,7 @@ tesseract encode "H:\" "X:\Backup\h_drive.tesseract" -w 30 -v
 tesseract encode "D:\Photos" "E:\archive.tesseract" --encrypt -r 5 -m "Photos backup 2026"
 
 # Solid mode, max compression, exclude temp files
-tesseract encode "D:\Projects" "E:\projects.tesseract" -s -c 9 -e "*.tmp" -e "node_modules" -e "__pycache__"
+tesseract encode "D:\Projects" "E:\projects.tesseract" -s -c 22 -e "*.tmp" -e "node_modules" -e "__pycache__"
 ```
 
 ---
@@ -138,15 +143,6 @@ tesseract info <archive> [options]
 | `--list-files` | `-l` | flag | List all files in the archive |
 | `--list-groups` | `-g` | flag | List duplicate groups |
 
-**Examples:**
-
-```bash
-tesseract info "E:\archive.tesseract"
-tesseract info "E:\archive.tesseract" -l          # list all files
-tesseract info "E:\archive.tesseract" -g          # show duplicate groups
-tesseract info "E:\encrypted.tesseract" -p mypass  # encrypted archive
-```
-
 ---
 
 ### `tesseract verify`
@@ -162,13 +158,6 @@ tesseract verify <archive> [options]
 | `--password` | `-p` | str | Password for encrypted archives |
 | `--verbose` | `-v` | flag | Verbose logging |
 
-**Examples:**
-
-```bash
-tesseract verify "E:\archive.tesseract"
-tesseract verify "E:\encrypted.tesseract" -p mypass -v
-```
-
 ---
 
 ### `tesseract split`
@@ -182,16 +171,6 @@ tesseract split <archive> [options]
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
 | `--size` | `-s` | int (MB) | 100 | Size of each volume in megabytes |
-
-**Examples:**
-
-```bash
-# Split into 100MB volumes (default)
-tesseract split "E:\large.tesseract"
-
-# Split into 4GB volumes for FAT32
-tesseract split "E:\large.tesseract" -s 4096
-```
 
 Output files are named `archive.001`, `archive.002`, etc.
 
@@ -209,16 +188,6 @@ tesseract join <first_volume> [options]
 |------|-------|------|-------------|
 | `--output` | `-o` | str | Output path (default: auto-named alongside volumes) |
 
-**Examples:**
-
-```bash
-# Join from first volume (auto-discovers .002, .003, etc.)
-tesseract join "E:\large.001"
-
-# Specify output path
-tesseract join "E:\large.001" -o "D:\rejoined.tesseract"
-```
-
 ---
 
 ### `tesseract repair`
@@ -227,17 +196,6 @@ Attempt to repair a damaged archive using embedded recovery records.
 
 ```
 tesseract repair <archive> [options]
-```
-
-| Flag | Short | Type | Description |
-|------|-------|------|-------------|
-| `--verbose` | `-v` | flag | Verbose logging |
-
-**Examples:**
-
-```bash
-tesseract repair "E:\damaged.tesseract"
-tesseract repair "E:\damaged.tesseract" -v
 ```
 
 > Requires recovery records (`-r` flag during encode). Without them, repair is not possible.
@@ -252,23 +210,17 @@ Display the comment embedded in an archive.
 tesseract comment <archive>
 ```
 
-**Example:**
-
-```bash
-tesseract comment "E:\archive.tesseract"
-```
-
 ---
 
 ## How It Works
 
 ### Encoding Pipeline (Failsafe Staged)
 
-1. **Scan** — recursively finds all files in the source directory
-2. **Deduplicate** — 3-stage content matching detects duplicate files
-3. **Hash** — computes full SHA-256 for all unique files
-4. **Preflight** — snapshots CRC32 + size of every source file
-5. **Stage shards** — compresses each unique file into a verified staging shard on disk
+1. **Scan** — recursively finds all files (cached in SQLite for subsequent runs)
+2. **Deduplicate** — 3-stage content matching: metadata → partial BLAKE3 (64KB) → full BLAKE3
+3. **Hash** — computes full BLAKE3 for all unique files (parallel, cached)
+4. **Preflight** — verifies every source file is readable and snapshots hashes
+5. **Stage shards** — compresses files into ~500MB multi-file shards (parallel with zstd)
 6. **Verify shards** — re-reads every shard from disk and verifies CRC32 integrity
 7. **Verify source** — re-checks all source files haven't changed since step 4
 8. **Assemble** — streams verified shards into a `.tmp` archive file
@@ -277,6 +229,15 @@ tesseract comment "E:\archive.tesseract"
 11. **Cleanup** — removes staging directory and any temp files
 
 If **any step fails**, source files remain completely untouched. The staging directory and `.tmp` file are cleaned up automatically.
+
+### Hash Cache
+
+Tesseract maintains a `.hashcache` SQLite database alongside the output archive with three tables:
+- **Full hashes** — keyed on (filepath, size, mtime_ns), auto-invalidated when files change
+- **Partial hashes** — 64KB BLAKE3 for deduplication, also auto-invalidated
+- **Scan cache** — directory scan results stored as JSON, validated against file metadata
+
+On subsequent runs, cached hashes are loaded instantly — only new or modified files need to be re-hashed.
 
 ### Archive Format (v2)
 
@@ -287,8 +248,8 @@ If **any step fails**, source files remain completely untouched. The staging dir
 │ Comment (variable)          │  UTF-8 text, up to 64KB
 ├─────────────────────────────┤
 │ Data Blocks                 │  Compressed file data (normal or solid mode)
-│   Normal: per-file blocks   │    80-byte block header + zlib stream [+ AES-GCM]
-│   Solid: single stream      │    16-byte solid header + continuous zlib [+ AES-GCM]
+│   Normal: per-file blocks   │    80-byte block header + zstd stream [+ AES-GCM]
+│   Solid: single stream      │    16-byte solid header + continuous zstd [+ AES-GCM]
 ├─────────────────────────────┤
 │ Manifest (gzip JSON)        │  File metadata, dedup groups, offsets [+ AES-GCM]
 ├─────────────────────────────┤
@@ -297,6 +258,18 @@ If **any step fails**, source files remain completely untouched. The staging dir
 │ Recovery Records (optional) │  XOR parity blocks for self-repair
 └─────────────────────────────┘
 ```
+
+## Testing
+
+```bash
+python -m pytest tests/ -q
+```
+
+142 tests covering the full pipeline including safety, encryption, recovery, deduplication, encoding/decoding roundtrips, and archive format validation.
+
+## License
+
+MIT License — see [LICENSE](LICENSE).
 
 ### Deduplication
 

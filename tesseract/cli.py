@@ -526,9 +526,9 @@ def main():
         help=f"Number of CPU cores to use (default: {_default_workers()})",
     )
     enc.add_argument(
-        "-c", "--compression-level", type=int, default=19,
+        "-c", "--compression-level", type=int, default=9,
         choices=range(1, 23), metavar="1-22",
-        help="zstd compression level (default: 19, max: 22)",
+        help="zstd compression level (default: 9, max: 22)",
     )
     enc.add_argument(
         "-e", "--exclude", action="append", default=[],
