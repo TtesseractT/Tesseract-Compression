@@ -16,7 +16,7 @@ A file is a "true duplicate" only if it matches on:
 import hashlib
 import logging
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -184,7 +184,7 @@ class Deduplicator:
         need_hash.sort(key=lambda e: (str(e.path.parent).lower(), e.path.name.lower()))
         path_to_entry = {str(e.path): e for e in need_hash}
         batch_size = 1000
-        with ProcessPoolExecutor(max_workers=self.workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
             for start in range(0, len(need_hash), batch_size):
                 batch = need_hash[start:start + batch_size]
                 futures = {

@@ -10,6 +10,7 @@ setup(
         "tqdm>=4.60.0",
         "cryptography>=41.0.0",
         "blake3>=0.3.0",
+        "zstandard>=0.19.0",
     ],
     extras_require={
         "dev": ["pytest>=7.0", "pytest-cov>=4.0"],

@@ -22,7 +22,7 @@ import blake3
 import logging
 import os
 import shutil
-import zlib
+import zstandard as zstd
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -283,13 +283,17 @@ class TesseractDecoder:
         solid_header = unpack_solid_header(solid_header_data)
 
         # Decompress the entire solid stream
+        dctx = zstd.ZstdDecompressor()
         if decryptor:
             # Encrypted solid: read entire stream, decrypt at once, then decompress
             encrypted_data = archive.read(solid_header.total_compressed)
             compressed_data = decryptor.decrypt(encrypted_data)
-            decompressed_buf = bytearray(zlib.decompress(compressed_data))
+            decompressed_buf = bytearray(dctx.decompress(
+                compressed_data,
+                max_output_size=solid_header.total_uncompressed,
+            ))
         else:
-            decompressor = zlib.decompressobj()
+            decompressor = dctx.decompressobj()
             remaining = solid_header.total_compressed
             decompressed_buf = bytearray()
 
@@ -300,13 +304,6 @@ class TesseractDecoder:
                     break
                 remaining -= len(chunk)
                 decompressed_buf.extend(decompressor.decompress(chunk))
-
-            try:
-                final = decompressor.flush()
-                if final:
-                    decompressed_buf.extend(final)
-            except zlib.error:
-                pass
 
         # Extract individual files from the decompressed stream
         files_extracted = 0
@@ -365,11 +362,16 @@ class TesseractDecoder:
         block_header_data = archive.read(BLOCK_HEADER_SIZE)
         block_header = unpack_block_header(block_header_data)
 
+        dctx = zstd.ZstdDecompressor()
+
         if decryptor:
             # Encrypted mode: read entire block, decrypt, then decompress
             encrypted_data = archive.read(block_header.compressed_size)
             compressed_data = decryptor.decrypt(encrypted_data)
-            decompressed = zlib.decompress(compressed_data)
+            decompressed = dctx.decompress(
+                compressed_data,
+                max_output_size=block_header.original_size,
+            )
 
             hasher = blake3.blake3(decompressed)
 
@@ -379,7 +381,7 @@ class TesseractDecoder:
             bytes_written = len(decompressed)
         else:
             # Streaming decompression
-            decompressor = zlib.decompressobj()
+            decompressor = dctx.decompressobj()
             hasher = blake3.blake3()
             bytes_written = 0
             remaining_compressed = block_header.compressed_size
@@ -394,7 +396,7 @@ class TesseractDecoder:
 
                     try:
                         decompressed = decompressor.decompress(compressed_chunk)
-                    except zlib.error as e:
+                    except zstd.ZstdError as e:
                         out.close()
                         output_path.unlink(missing_ok=True)
                         raise RuntimeError(
@@ -405,15 +407,6 @@ class TesseractDecoder:
                         hasher.update(decompressed)
                         out.write(decompressed)
                         bytes_written += len(decompressed)
-
-                try:
-                    final = decompressor.flush()
-                except zlib.error:
-                    final = b""
-                if final:
-                    hasher.update(final)
-                    out.write(final)
-                    bytes_written += len(final)
 
         # Verify size
         if bytes_written != block_header.original_size:

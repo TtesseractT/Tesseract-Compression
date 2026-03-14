@@ -29,7 +29,7 @@ CRITICAL SAFETY:
 import logging
 import os
 import struct
-import zlib
+import zstandard as zstd
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -47,7 +47,7 @@ from .archive_format import (
     pack_block_header,
     pack_solid_header,
 )
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 from .deduplicator import Deduplicator, DuplicateGroup
 from .hasher import compute_full_hash
@@ -58,6 +58,8 @@ from .scanner import FileEntry, FileScanner
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB streaming chunks
+SMALL_FILE_THRESHOLD = 1 * 1024 * 1024  # 1 MB — files below this get fast compression
+FAST_COMPRESSION_LEVEL = 3  # zstd level 3: still great ratio, ~50x faster than 19+
 
 
 def _compress_shard_worker(
@@ -68,12 +70,18 @@ def _compress_shard_worker(
     original_size: int,
     compression_level: int,
 ) -> Tuple[str, str, str, int, int, Optional[str]]:
-    """Top-level worker for parallel shard compression. Must be picklable.
+    """Worker for parallel shard compression. Uses ThreadPoolExecutor (zstd releases the GIL).
+
+    Adaptive compression: small files get FAST_COMPRESSION_LEVEL (high levels
+    gain almost nothing on small data), large files get the requested level.
 
     Returns (shard_path, relative_path, full_hash, original_size, compressed_size, error).
     """
     try:
-        compressor = zlib.compressobj(compression_level)
+        # Adaptive level: high compression wastes CPU on small files
+        effective_level = FAST_COMPRESSION_LEVEL if original_size < SMALL_FILE_THRESHOLD else compression_level
+        cctx = zstd.ZstdCompressor(level=effective_level)
+        compressor = cctx.compressobj()
         compressed_size = 0
 
         with open(shard_path_str, "wb") as shard_fh:
@@ -109,7 +117,7 @@ def _compress_shard_worker(
         return (shard_path_str, relative_path, full_hash, original_size, compressed_size, None)
     except Exception as e:
         return (shard_path_str, relative_path, full_hash, original_size, 0, str(e))
-DEFAULT_COMPRESSION_LEVEL = 6
+DEFAULT_COMPRESSION_LEVEL = 19
 
 
 class TesseractEncoder:
@@ -344,8 +352,9 @@ class TesseractEncoder:
                             raise
                 else:
                     # Normal mode: parallel shard compression
-                    batch_size = 500
-                    with ProcessPoolExecutor(max_workers=self.workers) as executor:
+                    # ThreadPoolExecutor works because zstd releases the GIL during compression
+                    batch_size = 2000
+                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
                         for start in range(0, len(unique_entries), batch_size):
                             batch = unique_entries[start:start + batch_size]
                             futures = {}
@@ -581,8 +590,10 @@ class TesseractEncoder:
         block_header_offset = archive.tell()
         archive.write(b"\x00" * BLOCK_HEADER_SIZE)
 
-        # Stream-compress the file
-        compressor = zlib.compressobj(self.compression_level)
+        # Stream-compress the file (adaptive level for small files)
+        effective_level = FAST_COMPRESSION_LEVEL if entry.size < SMALL_FILE_THRESHOLD else self.compression_level
+        cctx = zstd.ZstdCompressor(level=effective_level, threads=self.workers)
+        compressor = cctx.compressobj()
         compressed_size = 0
 
         if encryptor:
@@ -636,7 +647,8 @@ class TesseractEncoder:
         solid_header_offset = archive.tell()
         archive.write(b"\x00" * SOLID_HEADER_SIZE)
 
-        compressor = zlib.compressobj(self.compression_level)
+        cctx = zstd.ZstdCompressor(level=self.compression_level, threads=self.workers)
+        compressor = cctx.compressobj()
         total_uncompressed = 0
         total_compressed = 0
         stream_offset = 0  # offset within the uncompressed stream
