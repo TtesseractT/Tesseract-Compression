@@ -39,3 +39,4 @@ Desktop.ini
 *.pyo
 *.cython-311.pyc
 *.cython-311.pyo
+.cython.pyc
