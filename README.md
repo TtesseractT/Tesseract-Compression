@@ -1,6 +1,10 @@
-# Tesseract Compression System
+<p align="center">
+	<img src="LOGO.png" alt="Tesseract Compression System logo" width="220" />
+</p>
 
-**v2.0.0** — Deduplication-based archiver built for cold storage.
+<h1 align="center">Tesseract Compression System</h1>
+
+<p align="center"><strong>v2.0.0</strong> — Deduplication-based archiver built for cold storage.</p>
 
 Tesseract scans a directory, detects duplicate files using multi-stage content-aware matching, and compresses only unique data into a single `.tesseract` archive. Designed for archiving large drives (12TB+) where duplicate files waste significant space.
 
