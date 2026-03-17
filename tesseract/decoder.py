@@ -65,11 +65,20 @@ class TesseractDecoder:
         """Check if a file matches the extraction patterns (empty = extract all)."""
         if not self.extract_patterns:
             return True
+        filename = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
+        # Also handle Windows-style backslash separators in manifest paths
+        if "\\" in filename:
+            filename = filename.rsplit("\\", 1)[-1]
         for pattern in self.extract_patterns:
+            # Match against full relative path
             if fnmatch.fnmatch(rel_path, pattern):
                 return True
-            # Also match if pattern is a prefix (directory)
-            if rel_path.startswith(pattern.rstrip("*").rstrip("/")):
+            # Match against just the filename (so *.jpg works for nested files)
+            if fnmatch.fnmatch(filename, pattern):
+                return True
+            # Match if pattern is a directory prefix (e.g. "docs/*")
+            prefix = pattern.rstrip("*").rstrip("/")
+            if prefix and rel_path.startswith(prefix):
                 return True
         return False
 
@@ -446,7 +455,8 @@ class TesseractDecoder:
         errors = []
         verified = 0
 
-        check_paths = extracted_paths or manifest.files.keys()
+        # Preserve intentional empty selections (e.g., filters that match nothing).
+        check_paths = manifest.files.keys() if extracted_paths is None else extracted_paths
 
         for rel_path in check_paths:
             file_info = manifest.files.get(rel_path)

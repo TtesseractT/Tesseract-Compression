@@ -258,6 +258,42 @@ class TestSelectiveExtraction:
         for name in extracted:
             assert name.startswith("docs"), f"Unexpected file extracted: {name}"
 
+    def test_extract_by_extension_only_gets_matching_files(self, sample_tree, tmp_path):
+        archive = tmp_path / "out_ext.tesseract"
+        encoder = TesseractEncoder(workers=1)
+        encoder.encode(sample_tree, archive)
+
+        output = tmp_path / "jpgs_only"
+        decoder = TesseractDecoder(
+            workers=1, extract_patterns=["*.jpg"], verify=True
+        )
+        decoder.decode(archive, output)
+
+        extracted = []
+        for root, _, files in os.walk(output):
+            for name in files:
+                extracted.append(name)
+
+        assert len(extracted) > 0, "Expected at least one .jpg to be extracted"
+        for name in extracted:
+            assert name.endswith(".jpg"), f"Non-.jpg file extracted: {name}"
+
+    def test_extract_no_matches_does_not_fail_verification(self, sample_tree, tmp_path):
+        archive = tmp_path / "out_nomatch.tesseract"
+        encoder = TesseractEncoder(workers=1)
+        encoder.encode(sample_tree, archive)
+
+        output = tmp_path / "partial_nomatch"
+        decoder = TesseractDecoder(
+            workers=1, extract_patterns=["*.doesnotexist"], verify=True
+        )
+
+        # Should complete without trying to verify the entire manifest.
+        decoder.decode(archive, output)
+
+        extracted_files = list(output.rglob("*")) if output.exists() else []
+        assert not [p for p in extracted_files if p.is_file()]
+
 
 class TestReadManifest:
     def test_read_manifest_without_extraction(self, sample_tree, tmp_path):
