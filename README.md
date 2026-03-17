@@ -273,7 +273,7 @@ On subsequent runs, cached hashes are loaded instantly — only new or modified 
 python -m pytest tests/ -q
 ```
 
-142 tests covering the full pipeline including safety, encryption, recovery, deduplication, encoding/decoding roundtrips, and archive format validation.
+145 tests covering the full pipeline including safety, encryption, recovery, deduplication, encoding/decoding roundtrips, and archive format validation.
 
 ## License
 
@@ -324,7 +324,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
 
-142 tests covering all modules, pipeline roundtrips, encryption, recovery, staging safety, and edge cases.
+145 tests covering all modules, pipeline roundtrips, encryption, recovery, staging safety, and edge cases.
 
 ## License
 
