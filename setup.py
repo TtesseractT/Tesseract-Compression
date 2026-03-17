@@ -8,6 +8,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "tqdm>=4.60.0",
+        "rich>=13.7.0",
         "cryptography>=41.0.0",
         "blake3>=0.3.0",
         "zstandard>=0.19.0",

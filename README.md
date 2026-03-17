@@ -18,12 +18,14 @@ Tesseract scans a directory, detects duplicate files using multi-stage content-a
 - **Archive comments** — embed text metadata in archives
 - **File permission storage** — optional preservation of file permissions
 - **Archive locking** — mark archives as finalized
+- **Polished terminal UI** — rich-powered progress, cleaner summaries, and automatic fallback for plain terminals
 - **Fully parallelized** — multi-threaded hashing, deduplication, compression, verification, and preflight checks
 
 ## Requirements
 
 - Python ≥ 3.9
 - `tqdm` ≥ 4.60.0
+- `rich` ≥ 13.7.0
 - `cryptography` ≥ 41.0.0
 - `blake3` ≥ 0.3.0
 - `zstandard` ≥ 0.19.0
@@ -57,6 +59,8 @@ tesseract decode "D:\Backups\myfiles.tesseract" "D:\Restored"
 ### `tesseract encode`
 
 Create a `.tesseract` archive from a directory.
+
+The CLI now prefers a single live progress region with structured summaries instead of stacking multiple `tqdm` bars. Set the environment variable `TESSERACT_PLAIN=1` if you want plain terminal output.
 
 ```
 tesseract encode <source> <output> [options]

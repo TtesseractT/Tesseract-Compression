@@ -35,3 +35,7 @@ Desktop.ini
 *.hashcache
 *_staging/
 *.tmp
+*.pyc
+*.pyo
+*.cython-311.pyc
+*.cython-311.pyo

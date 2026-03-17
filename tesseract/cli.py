@@ -20,15 +20,9 @@ from pathlib import Path
 
 from .encoder import TesseractEncoder
 from .decoder import TesseractDecoder
+from .terminal_ui import CommandUI
 
 logger = logging.getLogger("tesseract")
-
-# Try to import tqdm for progress bars; fall back to basic logging
-try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
 
 
 def _default_workers() -> int:
@@ -46,71 +40,6 @@ def _prompt_password(confirm: bool = False) -> str:
             print("Error: Passwords do not match", file=sys.stderr)
             sys.exit(1)
     return password
-
-
-class ProgressTracker:
-    """Bridges the progress_callback interface to tqdm or logging."""
-
-    PHASE_LABELS = {
-        "scanning": "Scanning files",
-        "deduplicating": "Grouping by metadata",
-        "partial_hashing": "Partial hashing (64KB)",
-        "full_hashing": "Full BLAKE3 hashing",
-        "hashing_unique": "Hashing unique files",
-        "preflight": "Pre-flight verification",
-        "staging": "Staging shards",
-        "verifying_shards": "Verifying shards",
-        "verifying_source": "Verifying source files",
-        "assembling": "Assembling archive",
-        "writing": "Writing archive",
-        "verifying": "Verifying archive",
-        "finalizing": "Finalizing",
-        "recovery": "Recovery records",
-        "reading_header": "Reading header",
-        "reading_manifest": "Reading manifest",
-        "extracting": "Extracting files",
-        "restoring_duplicates": "Restoring duplicates",
-        "verifying_extracted": "Verifying extracted files",
-    }
-
-    def __init__(self, use_tqdm: bool = True):
-        self.use_tqdm = use_tqdm and HAS_TQDM
-        self._bar = None
-        self._current_phase = ""
-
-    def __call__(self, event: str, value=None, total: int = 0):
-        if event == "phase":
-            self._set_phase(value, total)
-        elif event == "step":
-            if self._bar is not None:
-                self._bar.update(value if value else 1)
-
-    def _set_phase(self, phase: str, total: int = 0):
-        if self._bar is not None:
-            self._bar.close()
-            self._bar = None
-        self._current_phase = phase
-        label = self.PHASE_LABELS.get(phase, phase)
-        if self.use_tqdm and total > 0:
-            self._bar = tqdm(
-                total=total, desc=label, unit="file",
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
-            )
-        elif self.use_tqdm and total == -1:
-            # Counter mode: no known total, just count up
-            self._bar = tqdm(
-                desc=label, unit="file",
-                bar_format="{desc}: {n_fmt} {unit} [{elapsed}]",
-            )
-        else:
-            logger.info(f"{label}..." + (f" ({total} items)" if total > 0 else ""))
-
-    def close(self):
-        if self._bar is not None:
-            self._bar.close()
-            self._bar = None
-
-
 # ── CLI Commands ──────────────────────────────────────────────────
 
 def cmd_encode(args):
@@ -121,6 +50,8 @@ def cmd_encode(args):
     if not output.suffix:
         output = output.with_suffix(".tesseract")
 
+    ui = CommandUI("encode", [("Source", source), ("Output", output)])
+
     # Handle password
     password = None
     if args.password:
@@ -128,7 +59,7 @@ def cmd_encode(args):
     elif args.encrypt:
         password = _prompt_password(confirm=True)
 
-    tracker = ProgressTracker(use_tqdm=True)
+    tracker = ui.tracker()
 
     encoder = TesseractEncoder(
         workers=args.workers or _default_workers(),
@@ -146,13 +77,15 @@ def cmd_encode(args):
     try:
         manifest = encoder.encode(source, output)
         tracker.close()
-        print(f"\nArchive created: {output}")
-        print(f"  Total files:       {manifest.file_count}")
-        print(f"  Unique stored:     {manifest.unique_count}")
-        print(f"  Duplicate groups:  {manifest.duplicate_group_count}")
-        print(f"  Original size:     {_fmt_size(manifest.total_original_size)}")
-        print(f"  Archive size:      {_fmt_size(output.stat().st_size)}")
-        print(f"  Dedup savings:     {_fmt_size(manifest.space_savings)}")
+        rows = [
+            ("Archive", output),
+            ("Total files", manifest.file_count),
+            ("Unique stored", manifest.unique_count),
+            ("Duplicate groups", manifest.duplicate_group_count),
+            ("Original size", _fmt_size(manifest.total_original_size)),
+            ("Archive size", _fmt_size(output.stat().st_size)),
+            ("Dedup savings", _fmt_size(manifest.space_savings)),
+        ]
         features = []
         if args.solid:
             features.append("solid")
@@ -165,10 +98,11 @@ def cmd_encode(args):
         if args.lock:
             features.append("locked")
         if features:
-            print(f"  Features:          {', '.join(features)}")
+            rows.append(("Features", ", ".join(features)))
+        ui.print_summary("Archive created", rows)
     except Exception as e:
         tracker.close()
-        logger.error(f"Encoding failed: {e}")
+        ui.print_error("Encoding failed", e)
         sys.exit(1)
 
 
@@ -176,6 +110,7 @@ def cmd_decode(args):
     """Extract a .tesseract archive to a directory."""
     archive = Path(args.archive)
     output = Path(args.output)
+    ui = CommandUI("decode", [("Archive", archive), ("Output", output)])
 
     # Handle password
     password = None
@@ -189,7 +124,7 @@ def cmd_decode(args):
         if header.is_encrypted:
             password = _prompt_password(confirm=False)
 
-    tracker = ProgressTracker(use_tqdm=True)
+    tracker = ui.tracker()
 
     decoder = TesseractDecoder(
         workers=args.workers or _default_workers(),
@@ -203,17 +138,23 @@ def cmd_decode(args):
     try:
         manifest = decoder.decode(archive, output)
         tracker.close()
-        print(f"\nExtracted to: {output}")
-        print(f"  Total files restored: {manifest.file_count}")
+        ui.print_summary(
+            "Archive extracted",
+            [
+                ("Output", output),
+                ("Total files restored", manifest.file_count),
+            ],
+        )
     except Exception as e:
         tracker.close()
-        logger.error(f"Decoding failed: {e}")
+        ui.print_error("Decoding failed", e)
         sys.exit(1)
 
 
 def cmd_info(args):
     """Display information about a .tesseract archive."""
     archive = Path(args.archive)
+    ui = CommandUI("info", [("Archive", archive)])
 
     # Handle password for encrypted archives
     password = None
@@ -239,21 +180,22 @@ def cmd_info(args):
     with open(archive, "rb") as f:
         header = unpack_header(f.read(HEADER_SIZE))
 
-    print(f"Archive: {archive}")
-    print(f"  Version:           {manifest.version}")
-    print(f"  Created:           {manifest.created}")
-    print(f"  Source:            {manifest.source_root}")
-    print(f"  Total files:       {manifest.file_count}")
-    print(f"  Unique stored:     {manifest.unique_count}")
-    print(f"  Duplicate groups:  {manifest.duplicate_group_count}")
-    print(f"  Original size:     {_fmt_size(manifest.total_original_size)}")
-    print(f"  Unique data size:  {_fmt_size(manifest.total_unique_size)}")
-    print(f"  Archive size:      {_fmt_size(archive_size)}")
-    print(f"  Dedup savings:     {_fmt_size(manifest.space_savings)}")
+    rows = [
+        ("Version", manifest.version),
+        ("Created", manifest.created),
+        ("Source", manifest.source_root),
+        ("Total files", manifest.file_count),
+        ("Unique stored", manifest.unique_count),
+        ("Duplicate groups", manifest.duplicate_group_count),
+        ("Original size", _fmt_size(manifest.total_original_size)),
+        ("Unique data size", _fmt_size(manifest.total_unique_size)),
+        ("Archive size", _fmt_size(archive_size)),
+        ("Dedup savings", _fmt_size(manifest.space_savings)),
+    ]
 
     if manifest.total_original_size > 0:
         ratio = archive_size / manifest.total_original_size
-        print(f"  Compression ratio: {ratio:.2%}")
+        rows.append(("Compression ratio", f"{ratio:.2%}"))
 
     # Feature flags
     features = []
@@ -268,10 +210,12 @@ def cmd_info(args):
     if header.has_permissions:
         features.append("permissions stored")
     if features:
-        print(f"  Features:          {', '.join(features)}")
+        rows.append(("Features", ", ".join(features)))
 
     if manifest.comment:
-        print(f"  Comment:           {manifest.comment}")
+        rows.append(("Comment", manifest.comment))
+
+    ui.print_summary("Archive information", rows)
 
     if args.list_files:
         print(f"\n  Files ({manifest.file_count}):")
@@ -293,6 +237,7 @@ def cmd_info(args):
 def cmd_verify(args):
     """Verify the integrity of a .tesseract archive."""
     archive = Path(args.archive)
+    ui = CommandUI("verify", [("Archive", archive)])
 
     from .archive_format import unpack_header, HEADER_SIZE, MAGIC_FOOTER
     from .manifest import Manifest
@@ -375,33 +320,47 @@ def cmd_verify(args):
             else:
                 print("Recovery: None")
 
-        print("\nArchive integrity: PASSED")
+        ui.print_summary(
+            "Archive integrity: PASSED",
+            [
+                ("Archive", archive),
+                ("Status", "verified"),
+            ],
+        )
 
     except Exception as e:
-        logger.error(f"Verification failed: {e}")
+        ui.print_error("Verification failed", e)
         sys.exit(1)
 
 
 def cmd_split(args):
     """Split a .tesseract archive into multi-volume parts."""
     archive = Path(args.archive)
+    ui = CommandUI("split", [("Archive", archive), ("Volume size", f"{args.size} MB")])
 
     from .volume import split_archive
 
     volume_size = args.size * 1024 * 1024  # Convert MB to bytes
 
-    tracker = ProgressTracker(use_tqdm=True)
+    tracker = ui.tracker()
 
     try:
         volumes = split_archive(
             archive, volume_size=volume_size, progress_callback=tracker,
         )
         tracker.close()
-        print(f"\nSplit into {len(volumes)} volumes:")
+        ui.print_summary(
+            "Archive split complete",
+            [
+                ("Volumes", len(volumes)),
+                ("Archive", archive),
+            ],
+        )
         for v in volumes:
             print(f"  {v.name} ({_fmt_size(v.stat().st_size)})")
     except Exception as e:
-        logger.error(f"Split failed: {e}")
+        tracker.close()
+        ui.print_error("Split failed", e)
         sys.exit(1)
 
 
@@ -409,25 +368,34 @@ def cmd_join(args):
     """Reassemble multi-volume archive parts."""
     first_vol = Path(args.first_volume)
     output = Path(args.output) if args.output else None
+    ui = CommandUI("join", [("First volume", first_vol), ("Output", output or "auto")])
 
     from .volume import join_volumes
 
-    tracker = ProgressTracker(use_tqdm=True)
+    tracker = ui.tracker()
 
     try:
         result = join_volumes(
             first_vol, output_path=output, progress_callback=tracker,
         )
         tracker.close()
-        print(f"\nJoined archive: {result} ({_fmt_size(result.stat().st_size)})")
+        ui.print_summary(
+            "Archive joined",
+            [
+                ("Archive", result),
+                ("Size", _fmt_size(result.stat().st_size)),
+            ],
+        )
     except Exception as e:
-        logger.error(f"Join failed: {e}")
+        tracker.close()
+        ui.print_error("Join failed", e)
         sys.exit(1)
 
 
 def cmd_repair(args):
     """Attempt to repair a damaged archive using recovery records."""
     archive = Path(args.archive)
+    ui = CommandUI("repair", [("Archive", archive)])
 
     from .archive_format import unpack_header, HEADER_SIZE
     from .recovery import RecoveryRecord, repair_archive
@@ -449,38 +417,51 @@ def cmd_repair(args):
         data_start = HEADER_SIZE + header.comment_length
         data_end = header.manifest_offset
 
-        print(f"Recovery records: {len(recovery.parity_blocks)} parity blocks")
-        print(f"Data region: {_fmt_size(data_end - data_start)}")
-        print("Scanning for damage...")
+        ui.print_summary(
+            "Recovery scan",
+            [
+                ("Parity blocks", len(recovery.parity_blocks)),
+                ("Data region", _fmt_size(data_end - data_start)),
+            ],
+            border_style="yellow",
+        )
+        ui.print_message("Scanning archive for recoverable damage...", border_style="bright_black")
 
         checked, repaired = repair_archive(
             archive, data_start, data_end, recovery,
         )
 
         if repaired:
-            print(f"\nRepair complete: {checked} slices checked, {repaired} repaired")
+            ui.print_summary(
+                "Repair complete",
+                [("Slices checked", checked), ("Slices repaired", repaired)],
+            )
         else:
-            print(f"\nNo damage found: {checked} slices checked, all OK")
+            ui.print_summary(
+                "No damage found",
+                [("Slices checked", checked), ("Status", "all clear")],
+            )
 
     except RuntimeError as e:
-        logger.error(f"Repair failed: {e}")
+        ui.print_error("Repair failed", e)
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Repair failed: {e}")
+        ui.print_error("Repair failed", e)
         sys.exit(1)
 
 
 def cmd_comment(args):
     """Display or set the archive comment."""
     archive = Path(args.archive)
+    ui = CommandUI("comment", [("Archive", archive)])
 
     decoder = TesseractDecoder()
     comment = decoder.read_comment(archive)
 
     if comment:
-        print(f"Comment: {comment}")
+        ui.print_summary("Archive comment", [("Comment", comment)])
     else:
-        print("No comment set")
+        ui.print_message("No comment set")
 
 
 # ── Utility ───────────────────────────────────────────────────────
