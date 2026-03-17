@@ -10,10 +10,10 @@ Tesseract scans a directory, detects duplicate files using multi-stage content-a
 
 ## Features
 
-- **Content-aware deduplication** — 3-stage pipeline: metadata grouping → partial hash (64KB BLAKE3) → full BLAKE3
+- **Content-aware deduplication** — 3-stage pipeline: metadata grouping → partial hash (first + last 64KB using BLAKE3) → full BLAKE3
 - **Zstandard compression** — modern zstd compression with adaptive levels (fast for small files, full level for large files)
 - **Failsafe staged encoding** — files are compressed into verified multi-file shards (~500MB each) before atomic assembly; source files are never modified
-- **BLAKE3 hashing** — cryptographically secure, ~6x faster than SHA-256, used everywhere
+- **BLAKE3 hashing** — used for all partial and full hashing; ~6x faster than SHA-256 with strong cryptographic guarantees
 - **Persistent hash cache** — SQLite-backed cache for scan results, partial hashes, and full hashes; survives interruptions
 - **AES-256-GCM encryption** — password-based with PBKDF2-HMAC-SHA256 (600K iterations)
 - **Solid compression** — optional single continuous compressed stream for better ratios
@@ -43,7 +43,7 @@ pip install -e .
 For development (includes pytest):
 
 ```bash
-pip install -e ".[dev]"
+pip install -e "[dev]"
 ```
 
 ## Quick Start
@@ -225,7 +225,7 @@ tesseract comment <archive>
 ### Encoding Pipeline (Failsafe Staged)
 
 1. **Scan** — recursively finds all files (cached in SQLite for subsequent runs)
-2. **Deduplicate** — 3-stage content matching: metadata → partial BLAKE3 (64KB) → full BLAKE3
+2. **Deduplicate** — 3-stage content matching: metadata → partial BLAKE3 (first + last 64KB) → full BLAKE3
 3. **Hash** — computes full BLAKE3 for all unique files (parallel, cached)
 4. **Preflight** — verifies every source file is readable and snapshots hashes
 5. **Stage shards** — compresses files into ~500MB multi-file shards (parallel with zstd)
@@ -281,7 +281,8 @@ MIT License — see [LICENSE](LICENSE).
 
 ### Deduplication
 
-Files are grouped by (size, extension) → partial hash (first + last 64KB) → full SHA-256. Only one copy of each unique file is stored. Duplicates reference the master copy's data offset in the manifest.
+Files are grouped by (size, extension) → partial hash (first + last 64KB using BLAKE3) → full BLAKE3.  
+Only one copy of each unique file is stored. Duplicates reference the master copy's data offset in the manifest.
 
 ### Encryption
 
@@ -309,7 +310,7 @@ tesseract/
 ├── safeguard.py         # Failsafe staging, CRC verification, preflight checks
 ├── scanner.py           # Recursive file discovery with exclusion patterns
 ├── deduplicator.py      # 3-stage duplicate detection
-├── hasher.py            # SHA-256 partial and full hashing
+├── hasher.py            # BLAKE3 partial and full hashing
 ├── manifest.py          # Archive manifest (gzip JSON)
 ├── archive_format.py    # Binary format v2 pack/unpack
 ├── encryption.py        # AES-256-GCM + PBKDF2 key derivation
@@ -320,7 +321,7 @@ tesseract/
 ## Running Tests
 
 ```bash
-pip install -e ".[dev]"
+pip install -e "[dev]"
 python -m pytest tests/ -v
 ```
 
